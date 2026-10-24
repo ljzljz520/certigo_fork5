@@ -18,11 +18,13 @@ package lib
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -109,7 +111,31 @@ func caBundle(caPath string) (*x509.CertPool, error) {
 	return bundle, nil
 }
 
-func VerifyChain(certs []*x509.Certificate, ocspStaple []byte, expectedName, caPath string) SimpleVerification {
+// VerifyOptions controls how VerifyChain validates a certificate chain.
+type VerifyOptions struct {
+	// ExpectedName is the DNS name or SPIFFE ID (spiffe://...) that the leaf
+	// certificate is expected to carry.
+	ExpectedName string
+	// CAPath is the path to the CA bundle to trust. When empty, the system
+	// default trust store is used.
+	CAPath string
+	// StrictSVID enables strict X.509-SVID validation. It only applies when
+	// ExpectedName is a SPIFFE ID. In this mode:
+	//   - CAPath is required, so the trust decision is anchored exclusively in
+	//     the explicitly supplied CA bundle rather than the system trust store,
+	//   - the leaf certificate must carry exactly one syntactically valid
+	//     SPIFFE URI SAN (with a non-root path) matching ExpectedName,
+	//   - the leaf certificate must conform to the X.509-SVID leaf profile:
+	//     cA=false, a critical key usage setting digitalSignature but not
+	//     keyCertSign/cRLSign, and - when present - only serverAuth/clientAuth
+	//     extended key usages.
+	//
+	// A malformed SPIFFE identity is rejected even if it is a byte-for-byte
+	// match for ExpectedName.
+	StrictSVID bool
+}
+
+func VerifyChain(certs []*x509.Certificate, ocspStaple []byte, opts VerifyOptions) SimpleVerification {
 	result := SimpleVerification{
 		Chains:         [][]simpleVerifyCert{},
 		OCSPWasStapled: ocspStaple != nil,
@@ -120,12 +146,31 @@ func VerifyChain(certs []*x509.Certificate, ocspStaple []byte, expectedName, caP
 		return result
 	}
 
+	spiffeIDExpected := strings.HasPrefix(strings.ToLower(opts.ExpectedName), "spiffe://")
+
+	if opts.StrictSVID {
+		if !spiffeIDExpected {
+			result.Error = fmt.Sprintf(
+				"strict X.509-SVID verification requires a SPIFFE ID, but expected name %q is not a SPIFFE ID",
+				opts.ExpectedName)
+			return result
+		}
+		if opts.CAPath == "" {
+			result.Error = "strict X.509-SVID verification requires an explicit CA bundle (specify one with --ca)"
+			return result
+		}
+		if _, err := parseLeafSPIFFEID(opts.ExpectedName); err != nil {
+			result.Error = fmt.Sprintf("expected SPIFFE ID %q is not a valid leaf X.509-SVID identity: %s", opts.ExpectedName, err)
+			return result
+		}
+	}
+
 	intermediates := x509.NewCertPool()
 	for i := 1; i < len(certs); i++ {
 		intermediates.AddCert(certs[i])
 	}
 
-	roots, err := caBundle(caPath)
+	roots, err := caBundle(opts.CAPath)
 	if err != nil {
 		result.Error = err.Error() + "\n"
 		return result
@@ -134,18 +179,23 @@ func VerifyChain(certs []*x509.Certificate, ocspStaple []byte, expectedName, caP
 	// x509 package doesn't support verifying SPIFFE IDs. When we're expecting a SPIFFE ID, we tell
 	// Certificate.Verify below to skip name matching, and then we perform our own matching later
 	// on.
-	spiffeIDExpected := strings.HasPrefix(strings.ToLower(expectedName), "spiffe://")
 	var expectedDNSName string
 	if !spiffeIDExpected {
-		expectedDNSName = expectedName
+		expectedDNSName = opts.ExpectedName
 	}
-	opts := x509.VerifyOptions{
+	verifyOpts := x509.VerifyOptions{
 		DNSName:       expectedDNSName,
 		Roots:         roots,
 		Intermediates: intermediates,
 	}
+	if opts.StrictSVID {
+		// The SVID extended key usage rules are enforced explicitly below once
+		// the trust path is built, so don't let path validation apply its
+		// default TLS server-auth EKU policy.
+		verifyOpts.KeyUsages = []x509.ExtKeyUsage{x509.ExtKeyUsageAny}
+	}
 
-	chains, err := certs[0].Verify(opts)
+	chains, err := certs[0].Verify(verifyOpts)
 	if err != nil {
 		result.Error = err.Error()
 		return result
@@ -154,7 +204,11 @@ func VerifyChain(certs []*x509.Certificate, ocspStaple []byte, expectedName, caP
 	if spiffeIDExpected {
 		// The Verify method above didn't actually verify that the certificate matches the expected
 		// SPIFFE ID. We thus perform this check explicitly here.
-		err = verifyCertificateSPIFFEIDMatch(certs[0], expectedName)
+		if opts.StrictSVID {
+			err = verifyCertificateSVID(certs[0], opts.ExpectedName)
+		} else {
+			err = verifyCertificateSPIFFEIDMatch(certs[0], opts.ExpectedName)
+		}
 		if err != nil {
 			result.Error = err.Error()
 			return result
@@ -314,4 +368,203 @@ func verifySPIFFEIDMatch(expected string, actual string) error {
 
 	// They match
 	return nil
+}
+
+// oidExtensionKeyUsage is the X.509 keyUsage extension OID (2.5.29.15).
+var oidExtensionKeyUsage = asn1.ObjectIdentifier{2, 5, 29, 15}
+
+const maxSPIFFEIDLength = 2048
+const maxSPIFFETrustDomainLength = 255
+
+// parseLeafSPIFFEID parses raw as a SPIFFE ID carried by an X.509-SVID leaf
+// certificate and enforces the SPIFFE identity grammar together with the
+// leaf-specific requirement of a non-root path component.
+//
+// Based on:
+//   - https://github.com/spiffe/spiffe/blob/main/standards/SPIFFE-ID.md
+//   - https://github.com/spiffe/spiffe/blob/main/standards/X509-SVID.md
+//
+// A SPIFFE ID consists of the "spiffe" scheme, a non-empty lowercase trust
+// domain (only a-z, 0-9, '.', '-' and '_') without userinfo, port or
+// percent-encoding, and no query or fragment component. Leaf SVIDs must
+// additionally carry a path with at least one non-empty, non-relative segment
+// made up of letters, digits, '.', '-' and '_'.
+func parseLeafSPIFFEID(raw string) (*url.URL, error) {
+	if raw == "" {
+		return nil, fmt.Errorf("SPIFFE ID is empty")
+	}
+	if len(raw) > maxSPIFFEIDLength {
+		return nil, fmt.Errorf("SPIFFE ID exceeds the maximum length of %d bytes", maxSPIFFEIDLength)
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("SPIFFE ID is not a valid URI: %w", err)
+	}
+	if u.Scheme != "spiffe" {
+		return nil, fmt.Errorf("SPIFFE ID scheme must be \"spiffe\"")
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("SPIFFE ID trust domain must not contain userinfo")
+	}
+	if u.Port() != "" {
+		return nil, fmt.Errorf("SPIFFE ID trust domain must not contain a port")
+	}
+
+	host := u.Host
+	if host == "" {
+		return nil, fmt.Errorf("SPIFFE ID trust domain must not be empty")
+	}
+	if len(host) > maxSPIFFETrustDomainLength {
+		return nil, fmt.Errorf("SPIFFE ID trust domain must not exceed %d bytes", maxSPIFFETrustDomainLength)
+	}
+	for _, r := range host {
+		if isSPIFFETrustDomainRune(r) {
+			continue
+		}
+		return nil, fmt.Errorf("SPIFFE ID trust domain %q contains invalid character %q (allowed characters are a-z, 0-9, '.', '-' and '_')", host, r)
+	}
+
+	if u.RawQuery != "" {
+		return nil, fmt.Errorf("SPIFFE ID must not contain a query component")
+	}
+	if u.Fragment != "" {
+		return nil, fmt.Errorf("SPIFFE ID must not contain a fragment component")
+	}
+
+	// Percent-encoding is forbidden in both the trust domain and the path.
+	if strings.Contains(raw, "%") {
+		return nil, fmt.Errorf("SPIFFE ID must not contain percent-encoded characters")
+	}
+
+	// X.509-SVID leaf certificates MUST have a non-root path component.
+	path := u.Path
+	if path == "" {
+		return nil, fmt.Errorf("leaf X.509-SVID SPIFFE ID must have a non-root path component")
+	}
+	if strings.HasSuffix(path, "/") {
+		return nil, fmt.Errorf("SPIFFE ID path must not have a trailing slash")
+	}
+	for _, segment := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
+		switch segment {
+		case "":
+			return nil, fmt.Errorf("SPIFFE ID path must not contain empty segments")
+		case ".", "..":
+			return nil, fmt.Errorf("SPIFFE ID path must not contain relative path segments %q", segment)
+		}
+		for _, r := range segment {
+			if isSPIFFEPathRune(r) {
+				continue
+			}
+			return nil, fmt.Errorf("SPIFFE ID path contains invalid character %q (allowed characters are letters, digits, '.', '-' and '_')", r)
+		}
+	}
+
+	return u, nil
+}
+
+func isSPIFFETrustDomainRune(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_'
+}
+
+func isSPIFFEPathRune(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+		r == '.' || r == '-' || r == '_'
+}
+
+// verifyCertificateSVID applies strict X.509-SVID leaf validation on top of
+// standard X.509 path validation (see section 5.2 of the X.509-SVID
+// specification). The certificate must:
+//   - carry exactly one syntactically valid SPIFFE URI SAN matching the
+//     expected SPIFFE ID (an identity that is malformed is rejected even when
+//     it is a byte-for-byte match for the expected ID),
+//   - be a leaf certificate: the basic constraints extension must be present
+//     with cA=false,
+//   - carry a critical key usage extension setting digitalSignature and not
+//     setting keyCertSign/cRLSign,
+//   - when an extended key usage extension is present, set both serverAuth and
+//     clientAuth and no other key purpose.
+func verifyCertificateSVID(cert *x509.Certificate, expectedSPIFFEID string) error {
+	// Section 2: an X.509 SVID MUST contain exactly one URI SAN.
+	if len(cert.URIs) == 0 {
+		return fmt.Errorf("x509: cannot validate certificate for %s, because it contains no URI SANs", expectedSPIFFEID)
+	}
+	if len(cert.URIs) > 1 {
+		return fmt.Errorf("x509: cannot validate certificate for %s, because it contains %d URI SANs instead of exactly 1", expectedSPIFFEID, len(cert.URIs))
+	}
+
+	// The identity is validated on its own merits first: a syntactically
+	// illegal SPIFFE URI does not become acceptable merely because the caller
+	// happens to expect the same string.
+	actualID := cert.URIs[0].String()
+	actual, err := parseLeafSPIFFEID(actualID)
+	if err != nil {
+		return fmt.Errorf("x509: certificate carries SPIFFE ID %q which is not a valid X.509-SVID identity: %s", actualID, err)
+	}
+	expected, err := parseLeafSPIFFEID(expectedSPIFFEID)
+	if err != nil {
+		return fmt.Errorf("x509: expected SPIFFE ID %q is not a valid X.509-SVID identity: %s", expectedSPIFFEID, err)
+	}
+	// Scheme and trust domain are case-insensitive (the grammar requires
+	// lowercase hosts), while the path is case-sensitive.
+	if !strings.EqualFold(actual.Host, expected.Host) || actual.Path != expected.Path {
+		return fmt.Errorf("x509: certificate is valid for %s, not %s", actualID, expectedSPIFFEID)
+	}
+
+	// Sections 4.1 and 5.2: leaf SVIDs MUST set cA=false.
+	if !cert.BasicConstraintsValid || cert.IsCA {
+		return fmt.Errorf("x509: SVID leaf certificate must include the basic constraints extension with cA=false")
+	}
+
+	// Section 4.3: the key usage extension MUST be present and marked
+	// critical. Leaf SVIDs MUST set digitalSignature and MUST NOT set
+	// keyCertSign or cRLSign.
+	if cert.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		return fmt.Errorf("x509: SVID leaf certificate key usage must set digitalSignature")
+	}
+	if cert.KeyUsage&(x509.KeyUsageCertSign|x509.KeyUsageCRLSign) != 0 {
+		return fmt.Errorf("x509: SVID leaf certificate key usage must not set keyCertSign or cRLSign")
+	}
+	if present, critical := findKeyUsageExtension(cert); !present {
+		return fmt.Errorf("x509: SVID leaf certificate must include the key usage extension")
+	} else if !critical {
+		return fmt.Errorf("x509: SVID leaf certificate key usage extension must be marked critical")
+	}
+
+	// Section 4.4: when present, EKU MUST set both serverAuth and clientAuth
+	// and MUST NOT contain any other key purpose.
+	if len(cert.ExtKeyUsage) > 0 || len(cert.UnknownExtKeyUsage) > 0 {
+		var hasServerAuth, hasClientAuth bool
+		for _, usage := range cert.ExtKeyUsage {
+			switch usage {
+			case x509.ExtKeyUsageServerAuth:
+				hasServerAuth = true
+			case x509.ExtKeyUsageClientAuth:
+				hasClientAuth = true
+			default:
+				name, ok := extKeyUsageStrings[usage]
+				if !ok {
+					name = fmt.Sprintf("extended key usage %d", usage)
+				}
+				return fmt.Errorf("x509: SVID leaf certificate extended key usage must only contain serverAuth and clientAuth, but certificate is valid for %s", name)
+			}
+		}
+		if len(cert.UnknownExtKeyUsage) > 0 {
+			return fmt.Errorf("x509: SVID leaf certificate extended key usage must only contain serverAuth and clientAuth, but certificate is valid for unknown key purpose %s", cert.UnknownExtKeyUsage[0].String())
+		}
+		if !hasServerAuth || !hasClientAuth {
+			return fmt.Errorf("x509: SVID leaf certificate extended key usage must set both serverAuth and clientAuth")
+		}
+	}
+
+	return nil
+}
+
+func findKeyUsageExtension(cert *x509.Certificate) (present bool, critical bool) {
+	for _, ext := range cert.Extensions {
+		if ext.Id.Equal(oidExtensionKeyUsage) {
+			return true, ext.Critical
+		}
+	}
+	return false, false
 }

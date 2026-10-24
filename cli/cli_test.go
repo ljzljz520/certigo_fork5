@@ -16,12 +16,22 @@
 package cli
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -241,4 +251,106 @@ func TestAppVersion(t *testing.T) {
 	defer func(v string) { version = v }(version)
 	version = "1.2.3"
 	assert.Equal(t, "1.2.3", appVersion(), "the -X override should win over build info")
+}
+
+// writePEMFile writes data as a PEM file in a temporary directory and returns
+// its path.
+func writePEMFile(t *testing.T, name string, der []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	data := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	return path
+}
+
+// generateSVIDChain builds a local root CA and a leaf certificate carrying
+// spiffeID. leafMutate can alter the leaf template to create non-conforming
+// SVIDs. The DER-encoded root and leaf certificates are returned.
+func generateSVIDChain(t *testing.T, spiffeID string, leafMutate func(*x509.Certificate)) (rootDER, leafDER []byte) {
+	t.Helper()
+
+	rootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	rootTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "Test SVID Root"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+	}
+	rootDER, err = x509.CreateCertificate(rand.Reader, rootTemplate, rootTemplate, &rootKey.PublicKey, rootKey)
+	require.NoError(t, err)
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	u, err := url.Parse(spiffeID)
+	require.NoError(t, err)
+	leafTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(2),
+		Subject:               pkix.Name{CommonName: "test-svid-leaf"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		URIs:                  []*url.URL{u},
+	}
+	if leafMutate != nil {
+		leafMutate(leafTemplate)
+	}
+	leafDER, err = x509.CreateCertificate(rand.Reader, leafTemplate, rootTemplate, &leafKey.PublicKey, rootKey)
+	require.NoError(t, err)
+	return rootDER, leafDER
+}
+
+func TestVerifyStrictSVID(t *testing.T) {
+	const spiffeID = "spiffe://example.org/path/service"
+	rootDER, leafDER := generateSVIDChain(t, spiffeID, nil)
+	rootPath := writePEMFile(t, "root.pem", rootDER)
+	leafPath := writePEMFile(t, "leaf.pem", leafDER)
+
+	// This case runs first: kingpin flag variables retain values parsed in
+	// earlier Run calls within the same test process, so omitting --ca only
+	// produces an empty value before any other subtest supplies one.
+	t.Run("--strict-svid requires an explicit CA bundle", func(t *testing.T) {
+		testTerminal := terminal.TestTerminal{Width: 80}
+		args := []string{"verify", "--name", spiffeID, "--strict-svid", leafPath}
+		assert.EqualValues(t, 1, Run(args, &testTerminal), "process should exit 1")
+		assert.Contains(t, testTerminal.OutputBuf.String(), "explicit CA bundle")
+	})
+
+	t.Run("conforming SVID passes with --strict-svid", func(t *testing.T) {
+		testTerminal := terminal.TestTerminal{Width: 80}
+		args := []string{"verify", "--name", spiffeID, "--ca", rootPath, "--strict-svid", leafPath}
+		assert.EqualValues(t, 0, Run(args, &testTerminal), "process should exit 0")
+		assert.Empty(t, testTerminal.ErrorBuf.Bytes(), "no error output expected")
+		assert.Contains(t, testTerminal.OutputBuf.String(), "Found 1 valid certificate chain(s)")
+	})
+
+	t.Run("wrong extended key usage fails with --strict-svid", func(t *testing.T) {
+		badRootDER, badLeafDER := generateSVIDChain(t, spiffeID, func(c *x509.Certificate) {
+			c.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageEmailProtection}
+		})
+		badRootPath := writePEMFile(t, "root.pem", badRootDER)
+		badLeafPath := writePEMFile(t, "bad-leaf.pem", badLeafDER)
+
+		testTerminal := terminal.TestTerminal{Width: 80}
+		args := []string{"verify", "--name", spiffeID, "--ca", badRootPath, "--strict-svid", badLeafPath}
+		assert.EqualValues(t, 1, Run(args, &testTerminal), "process should exit 1")
+		assert.Contains(t, testTerminal.OutputBuf.String(), "Failed to verify certificate chain:")
+		assert.Contains(t, testTerminal.OutputBuf.String(), "Email Protection")
+	})
+
+	t.Run("loose SPIFFE verification stays available without --strict-svid", func(t *testing.T) {
+		looseRootDER, looseLeafDER := generateSVIDChain(t, spiffeID, nil)
+		looseRootPath := writePEMFile(t, "loose-root.pem", looseRootDER)
+		looseLeafPath := writePEMFile(t, "loose-leaf.pem", looseLeafDER)
+
+		testTerminal := terminal.TestTerminal{Width: 80}
+		args := []string{"verify", "--name", spiffeID, "--ca", looseRootPath, looseLeafPath}
+		assert.EqualValues(t, 0, Run(args, &testTerminal), "loose SPIFFE verification should still pass")
+	})
 }

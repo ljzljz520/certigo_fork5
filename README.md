@@ -79,6 +79,7 @@ Commands:
     -l, --first               Only display the first certificate. This flag can be paired with --json or --pem.
         --verify              Verify certificate chain.
         --expected-name       Name expected in the server TLS certificate. Defaults to name from SNI or, if SNI not overridden, the hostname to connect to.
+        --strict-svid         When the expected name is a SPIFFE ID, enforce the X.509-SVID leaf profile and require an explicit --ca bundle.
 
   verify --name=NAME [<flags>] [<file>]
     Verify a certificate chain from file/stdin against a name.
@@ -87,6 +88,7 @@ Commands:
     -p, --password=PASSWORD  Password for PKCS12/JCEKS key stores (reads from TTY if missing).
     -n, --name=NAME          Server name to verify certificate against.
         --ca=CA              Path to CA bundle (system default if unspecified).
+        --strict-svid        When --name is a SPIFFE ID, enforce the X.509-SVID leaf profile and require an explicit --ca bundle.
     -j, --json               Write output as machine-readable JSON format.
 ```
 
